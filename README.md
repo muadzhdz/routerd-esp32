@@ -4,50 +4,48 @@
 
 <h1 align="center">routerd</h1>
 
-<p align="center"><b>Wi-Fi uplink gateway berbasis ESP32</b> — berbagi internet,
-hotspot tangguh, setup tanpa kabel.</p>
+<p align="center"><b>ESP32-based Wi-Fi uplink gateway</b> — share the internet,
+hardened hotspot, wire-free setup.</p>
 
 ---
 
-## Tentang
+## About
 
-ESP32 yang mengubah jaringan Wi-Fi apa pun menjadi hotspot sendiri —
-dengan NAT di level hardware, auto-failover antar beberapa jaringan tersimpan,
-dan dashboard web untuk konfigurasi lewat ponsel.
+An ESP32 that turns any Wi-Fi network into its own hotspot — with NAT at the
+hardware level, auto-failover across multiple saved networks, and a web
+dashboard for configuration right from your phone.
 
-- **Multi-network** — simpan hingga 5 jaringan, seleksi otomatis yang paling baru dipakai
-- **Auto-failover** — jaringan mati, pindah mulus ke kandidat berikutnya
-- **NAT (LwIP NAPT)** — satu uplink, banyak klien
-- **Zero-config** — setup sepenuhnya lewat captive portal, tanpa kabel
+- **Multi-network** — store up to 5 networks, auto-pick the most recently used
+- **Auto-failover** — network dies, switches seamlessly to the next candidate
+- **NAT (LwIP NAPT)** — one uplink, many clients
+- **Zero-config** — fully configured through a captive portal, no wires needed
 
-## Hardening
+## Quickstart
 
-| Parameter | Nilai |
+| Parameter | Value |
 |---|---|
 | Board | ESP32 (4MB flash / 520KB SRAM) |
 | AP SSID | `routerd` |
 | AP Password | `routerd123` |
 | AP IP | `192.168.4.1` |
 
-## Build
-
 ```sh
-make compile   # compile firmware
-make upload    # flash ke /dev/ttyUSB0
-make monitor   # serial log 115200
+make compile   # build firmware
+make upload    # flash to /dev/ttyUSB0
+make monitor   # serial log @115200
 ```
 
-Setelah flash: nyalakan, hubungkan ke AP `routerd`, ikuti dashboard.
+Power it on, connect to the `routerd` AP, and follow the dashboard.
 
-## Bahasa & Toolchain
+## Language & Toolchain
 
-| Lapisan | Teknologi |
+| Layer | Technology |
 |---|---|
 | Firmware | C++ (Arduino core over ESP-IDF) |
-| Boilerplate build | arduino-cli + Makefile |
-| Dashboard | HTML/CSS/JS inline (embedded) |
-| Protokol | WiFi 802.11, LwIP NAPT |
+| Build | arduino-cli + Makefile |
+| Dashboard | Inline HTML/CSS/JS (embedded) |
+| Networking | Wi-Fi 802.11, LwIP NAPT |
 
-## Lisensi
+## License
 
-MIT — silakan dipakai, dipelajari, dan dikembangkan.
+MIT — use it, study it, build on it.
