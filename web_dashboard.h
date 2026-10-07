@@ -5,6 +5,15 @@
 #include <WiFi.h>
 #include "storage.h"
 
+extern String activeSsid;
+
+// Uplink (STA) manager, implemented in routerd-esp32.ino. Single owner of
+// WiFi.begin/disconnect so the failover state machine never gets confused.
+void uplinkConnect(const String& ssid, const String& pass, int chan);
+void uplinkStop();
+void uplinkPause();
+void uplinkResume();
+
 class WebDashboardManager {
 private:
     WebServer server{80};
@@ -22,6 +31,7 @@ public:
         server.on("/scan", HTTP_GET, [this]() { handleScan(); });
         server.on("/save", HTTP_POST, [this]() { handleSave(); });
         server.on("/clear", HTTP_POST, [this]() { handleClear(); });
+        server.on("/forget", HTTP_POST, [this]() { handleForget(); });
         server.on("/reboot", HTTP_POST, [this]() { handleReboot(); });
         server.on("/favicon.svg", HTTP_GET, [this]() { handleFavicon(); });
 
@@ -62,6 +72,48 @@ public:
     }
 
 private:
+    // RFC 8259: inside a JSON string, '"', '\' and control chars < 0x20
+    // must be escaped. SSIDs are raw bytes from the air, so assume hostile.
+    static String jsonEscape(const String& in) {
+        String out;
+        out.reserve(in.length() + 8);
+        for (size_t i = 0; i < in.length(); i++) {
+            char c = in[i];
+            if (c == '"' || c == '\\') { out += '\\'; out += c; }
+            else if ((uint8_t)c < 0x20) {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
+                out += buf;
+            } else out += c;
+        }
+        return out;
+    }
+
+    static String htmlEscape(const String& in) {
+        String out;
+        out.reserve(in.length() + 8);
+        for (size_t i = 0; i < in.length(); i++) {
+            switch (in[i]) {
+                case '&': out += "&amp;";  break;
+                case '<': out += "&lt;";   break;
+                case '>': out += "&gt;";   break;
+                case '"': out += "&quot;"; break;
+                case '\'': out += "&#39;"; break;
+                default:  out += in[i];
+            }
+        }
+        return out;
+    }
+
+    // The HTTP server listens on every interface, including the WAN (STA)
+    // side. Anyone on the upstream LAN could otherwise wipe or reboot us.
+    // Only accept state-changing requests that arrived via the SoftAP.
+    bool requireLan() {
+        if (server.client().localIP() == WiFi.softAPIP()) return true;
+        server.send(403, "text/plain", "Forbidden: manage routerd from its own AP");
+        return false;
+    }
+
     void handleRoot() {
         server.send_P(200, "text/html", DASHBOARD_HTML);
     }
@@ -86,13 +138,22 @@ private:
     void handleApiStatus() {
         bool connected = (WiFi.status() == WL_CONNECTED);
         String json = "{";
-        json += "\"uplink_ssid\":\"" + storage.config.staSsid + "\",";
+        json += "\"uplink_ssid\":\"" + jsonEscape(activeSsid) + "\",";
         json += "\"uplink_connected\":" + String(connected ? "true" : "false") + ",";
         json += "\"uplink_ip\":\"" + (connected ? WiFi.localIP().toString() : "--") + "\",";
         json += "\"uplink_rssi\":" + String(connected ? WiFi.RSSI() : 0) + ",";
         json += "\"uplink_chan\":" + String(connected ? WiFi.channel() : 0) + ",";
-        json += "\"ap_ssid\":\"" + storage.config.apSsid + "\",";
+        json += "\"ap_ssid\":\"" + jsonEscape(storage.apSsid) + "\",";
         json += "\"ap_clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+        json += "\"saved_count\":" + String(storage.count()) + ",";
+        json += "\"saved\":[";
+        int shown = 0;
+        for (int i = 0; i < MAX_NETWORKS; i++) {
+            if (!storage.networks[i].used) continue;
+            if (shown++ > 0) json += ",";
+            json += "\"" + jsonEscape(storage.networks[i].ssid) + "\"";
+        }
+        json += "],";
         json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
         json += "\"uptime\":" + String(millis() / 1000);
         json += "}";
@@ -101,9 +162,14 @@ private:
 
     void handleScan() {
         Serial.println("[SCAN] Initiating 2.4GHz RF spectrum scan...");
-        // Ensure STA is not fighting for the RF synthesizer
-        WiFi.disconnect();
-        delay(100);
+        // A connected STA can scan between beacons without dropping the
+        // link. Only an STA stuck in a reconnect loop blocks the scanner
+        // (returns WIFI_SCAN_RUNNING), so we only pause it in that case.
+        bool wasConnected = (WiFi.status() == WL_CONNECTED);
+        if (!wasConnected) {
+            uplinkPause();
+            delay(100);
+        }
 
         int16_t n = WiFi.scanNetworks(false, false, false, 150);
         if (n < 0) {
@@ -116,24 +182,27 @@ private:
         String json = "[";
         int validCount = 0;
         for (int i = 0; i < n; ++i) {
-            String s = WiFi.SSID(i);
-            if (s.length() == 0) continue;
-            s.replace("\"", "\\\"");
+            String raw = WiFi.SSID(i);
+            if (raw.length() == 0) continue;
             if (validCount > 0) json += ",";
             json += "{";
-            json += "\"ssid\":\"" + s + "\",";
+            json += "\"ssid\":\"" + jsonEscape(raw) + "\",";
             json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
             json += "\"chan\":" + String(WiFi.channel(i)) + ",";
-            json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+            json += "\"secure\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + ",";
+            json += "\"saved\":" + String(storage.isSaved(raw) ? "true" : "false");
             json += "}";
             validCount++;
         }
         json += "]";
         WiFi.scanDelete();
         server.send(200, "application/json", json);
+
+        if (!wasConnected) uplinkResume();
     }
 
     void handleSave() {
+        if (!requireLan()) return;
         if (!server.hasArg("ssid")) {
             server.send(400, "text/plain", "Missing SSID parameter");
             return;
@@ -143,30 +212,52 @@ private:
         String newPass = server.hasArg("pass") ? server.arg("pass") : "";
         int chan = server.hasArg("chan") ? server.arg("chan").toInt() : 0;
 
-        Serial.printf("[HTTP] Uplink config received: SSID='%s' Chan=%d\n", newSsid.c_str(), chan);
-        storage.saveUplink(newSsid, newPass, chan);
+        // 802.11: SSID is 1..32 bytes. WPA2-PSK passphrase is 8..63 chars
+        // (or empty for an open network). Reject early instead of letting
+        // the supplicant fail silently with reason 15 (4-way handshake).
+        if (newSsid.length() == 0 || newSsid.length() > 32) {
+            server.send(400, "text/plain", "SSID must be 1-32 bytes");
+            return;
+        }
+        if (newPass.length() != 0 && (newPass.length() < 8 || newPass.length() > 63)) {
+            server.send(400, "text/plain", "Password must be empty or 8-63 chars");
+            return;
+        }
+        if (chan < 0 || chan > 13) chan = 0;
 
-        String response = "<!DOCTYPE html><html lang='id' data-theme='dark'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><link rel='icon' href='/favicon.svg' type='image/svg+xml'><style>:root{--bg:#0a0a0a;--panel:#111111;--line:rgba(255,255,255,0.1);--heading:#f0f0f0;--mono:ui-monospace,monospace;}body{background:var(--bg);color:var(--heading);font-family:var(--mono);padding:32px 16px;text-align:center;margin:0;box-sizing:border-box;min-height:100vh;display:flex;}.box{max-width:400px;width:100%;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:24px;}.brand{font-size:13px;letter-spacing:1px;color:#888;margin-bottom:12px;}.title{font-size:16px;font-weight:700;margin-bottom:8px;}</style></head><body><div class='box'><div class='brand'>ROUTERD // EMBEDDED</div><div class='title'>KREDENSIAL DISIMPAN</div><p style='color:#aaa;font-size:13px;'>Menyambungkan ke <b>" + newSsid + "</b>...</p><p style='color:#666;font-size:12px;margin-top:12px;'>Membuka dashboard dalam 4 detik...</p></div><script>setTimeout(()=>{window.location.href='/';},4000);</script></body></html>";
+        Serial.printf("[HTTP] Uplink config received: SSID='%s' Chan=%d\n", newSsid.c_str(), chan);
+        storage.upsert(newSsid, newPass);
+
+        String response = "<!DOCTYPE html><html lang='id' data-theme='dark'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><link rel='icon' href='/favicon.svg' type='image/svg+xml'><style>:root{--bg:#0a0a0a;--panel:#111111;--line:rgba(255,255,255,0.1);--heading:#f0f0f0;--mono:ui-monospace,monospace;}body{background:var(--bg);color:var(--heading);font-family:var(--mono);padding:32px 16px;text-align:center;margin:0;box-sizing:border-box;min-height:100vh;display:flex;}.box{max-width:400px;width:100%;margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:24px;}.brand{font-size:13px;letter-spacing:1px;color:#888;margin-bottom:12px;}.title{font-size:16px;font-weight:700;margin-bottom:8px;}</style></head><body><div class='box'><div class='brand'>ROUTERD // EMBEDDED</div><div class='title'>KREDENSIAL DISIMPAN</div><p style='color:#aaa;font-size:13px;'>Menyambungkan ke <b>" + htmlEscape(newSsid) + "</b>...</p><p style='color:#666;font-size:12px;margin-top:12px;'>Membuka dashboard dalam 4 detik...</p></div><script>setTimeout(()=>{window.location.href='/';},4000);</script></body></html>";
         server.send(200, "text/html", response);
 
         delay(100);
-        WiFi.disconnect();
-        if (chan > 0) {
-            WiFi.begin(newSsid.c_str(), newPass.c_str(), chan);
-        } else {
-            WiFi.begin(newSsid.c_str(), newPass.c_str());
-        }
+        uplinkConnect(newSsid, newPass, chan);
     }
 
     void handleClear() {
-        storage.clearUplink();
-        WiFi.disconnect();
-        startCaptiveDNS();
+        if (!requireLan()) return;
+        storage.clearAll();
+        uplinkStop();
         server.sendHeader("Location", "/", true);
         server.send(302, "text/plain", "");
     }
 
+    void handleForget() {
+        if (!requireLan()) return;
+        if (!server.hasArg("ssid")) {
+            server.send(400, "text/plain", "Missing SSID parameter");
+            return;
+        }
+        String ssid = server.arg("ssid");
+        bool gone = storage.forget(ssid);
+        if (activeSsid == ssid) uplinkStop();
+        Serial.printf("[HTTP] forget '%s' -> %s\n", ssid.c_str(), gone ? "removed" : "not found");
+        server.send(gone ? 200 : 404, "application/json", gone ? "{\"removed\":true}" : "{\"removed\":false}");
+    }
+
     void handleReboot() {
+        if (!requireLan()) return;
         server.send(200, "text/html", "Restarting ESP32 Gateway...");
         delay(500);
         ESP.restart();
@@ -381,6 +472,30 @@ const char WebDashboardManager::DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       font-size: 10px;
       color: var(--muted);
     }
+    .tag.saved {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: rgba(255,255,255,0.08);
+    }
+    .wifi-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-forget {
+      font-family: var(--mono);
+      font-size: 9px;
+      padding: 2px 6px;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .btn-forget:hover {
+      color: #ff7a7a;
+      border-color: rgba(255,122,122,0.5);
+    }
 
     /* ── FORM ELEMENTS ── */
     .form-group {
@@ -539,7 +654,7 @@ const char WebDashboardManager::DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     <!-- FOOTER CONTROLS -->
     <div class="footer-actions">
       <form action="/clear" method="POST" style="flex:1;">
-        <button type="submit" class="btn-subtle" style="width:100%;">[ PUTUSKAN UPLINK ]</button>
+        <button type="submit" class="btn-subtle" style="width:100%;">[ HAPUS SEMUA JARINGAN ]</button>
       </form>
       <form action="/reboot" method="POST" style="flex:1;">
         <button type="submit" class="btn-danger" style="width:100%;">[ REBOOT GATEWAY ]</button>
@@ -587,23 +702,40 @@ const char WebDashboardManager::DASHBOARD_HTML[] PROGMEM = R"rawliteral(
             list.innerHTML = '<div class="empty-state">Tidak ada sinyal Wi-Fi ditemukan. Coba scan ulang.</div>';
             return;
           }
-          let html = '';
+          // SSIDs are attacker-controlled (anyone can broadcast one), so they
+          // must never be parsed as HTML. Build nodes and assign textContent.
+          const el = (tag, cls, text) => {
+            const n = document.createElement(tag);
+            if (cls) n.className = cls;
+            if (text !== undefined) n.textContent = text;
+            return n;
+          };
+          list.replaceChildren();
           data.forEach(net => {
             const pct = Math.min(100, Math.max(0, 2 * (net.rssi + 100)));
-            html += `
-              <div class="wifi-item" onclick="pickNet('${net.ssid}', ${net.chan}, this)">
-                <div>
-                  <div class="wifi-ssid">${net.ssid}</div>
-                  <div class="wifi-meta">
-                    <span class="tag">CH ${net.chan}</span>
-                    <span class="tag">${net.secure ? 'WPA2' : 'OPEN'}</span>
-                    <span class="wifi-rssi">${net.rssi} dBm (${pct}%)</span>
-                  </div>
-                </div>
-                <div class="wifi-arrow">&rarr;</div>
-              </div>`;
+            const item = el('div', 'wifi-item');
+            const left = el('div');
+            const meta = el('div', 'wifi-meta');
+            meta.append(el('span', 'tag', 'CH ' + net.chan),
+                        el('span', 'tag', net.secure ? 'WPA2' : 'OPEN'));
+            if (net.saved) meta.append(el('span', 'tag saved', 'TERSIMPAN'));
+            meta.append(el('span', 'wifi-rssi', net.rssi + ' dBm (' + pct + '%)'));
+            left.append(el('div', 'wifi-ssid', net.ssid), meta);
+
+            const actions = el('div', 'wifi-actions');
+            if (net.saved) {
+              const b = el('button', 'btn-forget', '[ LUPA ]');
+              b.type = 'button';
+              b.addEventListener('click', e => { e.stopPropagation(); forgetNet(net.ssid); });
+              actions.append(b);
+            }
+            const arrow = el('div', 'wifi-arrow', '\u2192');
+            actions.append(arrow);
+
+            item.append(left, actions);
+            item.addEventListener('click', () => pickNet(net.ssid, net.chan, item));
+            list.append(item);
           });
-          list.innerHTML = html;
         })
         .catch(err => {
           btn.innerText = '[ SCAN SPEKTRUM ]';
@@ -617,6 +749,20 @@ const char WebDashboardManager::DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('ssid').value = ssid;
       document.getElementById('chan').value = chan;
       document.getElementById('pass').focus();
+    }
+
+    function forgetNet(ssid) {
+      const body = new URLSearchParams({ ssid: ssid });
+      fetch('/forget', { method: 'POST', body: body })
+        .then(r => r.json())
+        .then(d => {
+          if (d.removed) {
+            scanWifi();
+          } else {
+            alert('Gagal lupa: ' + ssid);
+          }
+        })
+        .catch(() => alert('Gagal lupa'));
     }
 
     updateStatus();
