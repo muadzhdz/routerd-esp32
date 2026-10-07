@@ -1,66 +1,53 @@
-# routerd-esp32
+<p align="center">
+  <img src="assets/logo.svg" width="96" height="96" alt="routerd logo">
+</p>
 
-Wi-Fi uplink gateway berbasis ESP32 (Xtensa LX6 @240MHz) dengan NAT (LwIP NAPT),
-hotspot SoftAP, dan dashboard web captive-portal untuk konfigurasi tanpa kabel.
+<h1 align="center">routerd</h1>
 
-## Fitur
+<p align="center"><b>Wi-Fi uplink gateway berbasis ESP32</b> — berbagi internet,
+hotspot tangguh, setup tanpa kabel.</p>
 
-- Uplink station (WAN) lewat jaringan Wi-Fi tersimpan, pemilihan **LRU**
-  (*least-recently-used* → yang paling baru dipakai menang) saat ada beberapa
-  jaringan dalam jangkauan.
-- Hingga **5 jaringan** disimpan di NVS flash (`net0_*` … `net4_*`) beserta
-  kartu waktu pemakaian terakhir (`seq`).
-- SoftAP + captive portal untuk setup: scan jaringan, simpan, lupakan, hapus.
-- NAPT: klien SoftAP memakai satu IP uplink (masquerade) untuk akses internet.
-- Favicon native: aset SVG `assets/logo.svg` diembed ke firmware dan disajikan
-  dari `/favicon.svg`.
+---
 
-## Flow boot
+## Tentang
 
-1. `setup()` membaca NVS → jika ada jaringan tersimpan: scan udara.
-2. Cocokkan SSID tersimpan dengan hasil scan → urutkan menurun oleh `seq` (LRU).
-3. Mulai dari yang paling baru dipakai; kegagalan auth menghitung mundur ke
-   kandidat berikutnya.
-4. Tidak ada kandidat: SoftAP fallback + captive portal, rescan dengan backoff.
+ESP32 yang mengubah jaringan Wi-Fi apa pun menjadi hotspot sendiri —
+dengan NAT di level hardware, auto-failover antar beberapa jaringan tersimpan,
+dan dashboard web untuk konfigurasi lewat ponsel.
 
-## Build & flash
+- **Multi-network** — simpan hingga 5 jaringan, seleksi otomatis yang paling baru dipakai
+- **Auto-failover** — jaringan mati, pindah mulus ke kandidat berikutnya
+- **NAT (LwIP NAPT)** — satu uplink, banyak klien
+- **Zero-config** — setup sepenuhnya lewat captive portal, tanpa kabel
 
-```sh
-make compile      # arduino-cli compile, FQBN esp32:esp32:esp32
-make upload       # arduino-cli upload ke /dev/ttyUSB0
-make monitor      # serial 115200
-```
-
-Requirement: `arduino-cli` dengan core `esp32` (dipasang lewat `arduino-cli core install esp32:esp32`).
-
-## Konfigurasi SoftAP default
+## Hardening
 
 | Parameter | Nilai |
 |---|---|
-| SSID | `routerd` |
-| Password | `routerd123` |
-| IP AP | `192.168.4.1` |
+| Board | ESP32 (4MB flash / 520KB SRAM) |
+| AP SSID | `routerd` |
+| AP Password | `routerd123` |
+| AP IP | `192.168.4.1` |
 
-## Routes utama
+## Build
 
-| Method | Route | Fungsi |
-|---|---|---|
-| GET | `/` | Dashboard |
-| GET | `/api/status` | Telemetri JSON (uplink, klien, heap) |
-| GET | `/scan` | Hasil scan + flag `saved` |
-| POST | `/save` | Simpan / perbarui kredensial & sambungkan |
-| POST | `/forget` | Lupakan satu SSID |
-| POST | `/clear` | Hapus semua jaringan |
-| POST | `/reboot` | Restart firmware |
-| GET | `/favicon.svg` | Logo |
+```sh
+make compile   # compile firmware
+make upload    # flash ke /dev/ttyUSB0
+make monitor   # serial log 115200
+```
 
-## Batas yang diketahui (known limitations)
+Setelah flash: nyalakan, hubungkan ke AP `routerd`, ikuti dashboard.
 
-- **Kredensial Wi-Fi tersimpan sebagai plaintext di NVS.** Enkripsi NVS membutuhkan
-  partisi `nvs_keys` + rebuild core ESP-IDF dengan `CONFIG_NVS_ENCRYPTION`; core
-  `esp32:esp32` bawaan Arduino tidak menyediakannya. Jangan simpan jaringan
-  kredensial-sensitif pada perangkat yang bisa dibongkar secara fisik.
-- Slot NVS terbatas 5 (konstanta `MAX_NETWORKS`); lebih dari itu menimpa slot
-  paling lama tidak dipakai.
-- SoftAP & STA berbagi satu radio: selama scan uplink, layanan AP dapat
-  terinterupsi sejenak.
+## Bahasa & Toolchain
+
+| Lapisan | Teknologi |
+|---|---|
+| Firmware | C++ (Arduino core over ESP-IDF) |
+| Boilerplate build | arduino-cli + Makefile |
+| Dashboard | HTML/CSS/JS inline (embedded) |
+| Protokol | WiFi 802.11, LwIP NAPT |
+
+## Lisensi
+
+MIT — silakan dipakai, dipelajari, dan dikembangkan.
